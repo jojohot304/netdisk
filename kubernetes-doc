@@ -1,0 +1,68 @@
+大背景就先不记了（CloudNative、康威定律这些了解一下就好了），先写之前已经学习理解的内容（妈的我发现我之前写笔记本都写了4页纸了。。）
+那就在之前的笔记上面做补充吧
+#####1.一些基本概念：
+**Static pod**： 在Node上手动创建的（未通过Master的api server创建的pod），也未存储于etcd当中
+
+**endpoint**： pod的ip+容器暴露的端口
+
+**pause容器**：每一个POD里面都会有一个Pause容器（Pod内所有容器共享Pause容器的ip以及Volume），方便实现容器之间的网络通信以及卷共享，同时Pause容器一般比业务容器要稳定可靠，可以作为Pod的状态标识向Kube-master反映整个Pod的状态
+资源： K8s当中管理的对象都叫做K8s的资源，从pod、RC、Server、Node到Cluster（相应的在Yaml或者Json的配置文件当中，根据资源的类型来创建不同的对象）
+
+**Replicate描述**：相当于期望Pod的一个运行状态，在其中会定义好Pod的副本数量，Pod使用的容器（容器repository、端口、容器的限额），Pod的label（replicate controller和Service controller后续都会通过label-select来定位到具体的pod进行管理）
+也就是说 Service是通过label来关联它的所有POD的
+
+**三种IP地址**： Node IP、Cluster IP、Pod IP，其中Node IP即为宿主机的IP地址，就是实际的物理ip地址，Cluster IP为K8s内部为每一个Service分配的唯一虚拟IP地址，Cluster IP无法用来与外部进行网络交互，只能在K8s内部使用；Pod IP为Docker0网桥网段里拿到的ip； 需要注意的是这三种IP在互相交互的时候使用的不是通常的路由规则，而是由K8s内部自定义的规则来进行网络通信的
+
+**service关联Pod**：在通常情况下，Service当中定义的属性是通过Linux环境变量的方式"注入"到Pod当中的（在容器创建的时候自动引入这些环境变量，主要是Service地址），这些变量已ServiceName_变量属性的方式进行命名；在最新的k8s版本当中，已经引入了DNS来根据Service的名称做Service地址获取（Service域名发现）
+
+**NameSpace**：在K8s集群当中也有Namespace的概念，其实就是为了方便多租户共同使用同一套K8s集群所设定的规则，所以在创建任何资源的时候都可以带上--namespace标签来定义对应的租户，如果不带标签的话，或将这些资源挂到default namespace下面
+
+---
+
+#####2.原理实现:
+**APIServer**： 本质上是一个Restful Server（对外提供k8s当中的各类资源的各种API），同时将这些资源的信息存储于Master上面的etcd当中；
+Controller Manager、Scheduler都是通过访问这些API来知晓当前Node上面的资源的状态的，同时采取相应的管理动作，指的一提的是，apiserver本身也是k8s当中的一个Service，其他进程访问Apiserver相当于访问一个Service
+
+**Controller Manager**：包含了各种资源、状态的Controller， Replication Controller、Node Controller、ResourceQuota Controller、Namespace、Service Account、Token、Service、Endpoint Controller
+
+**Schedule Controller**： 接收由Replicate Controller创建的Pod，将其安置到合适的Node，交给后面Node上面的Kubelet来创建实际的POD；
+Schedule Controller会按照一定的规则来针对当前集群中的所有Node进行打分（资源消耗最小原则、资源消耗均衡原则、标签优先原则），然后根据打分以及POD定义当中的一些属性来选择出合适的Node
+
+**kubelet**： Node上面的kubelet有几种方式获取Pod清单：
++ 手动指定配置文件
++ 手动指定http端点监听
++ 从Apiserver获取pod目录
+通过前两种创建的Pod都为静态Pod（kubelet也会将static pod的消息上报到apiserver，apiserver会为static pod创建mirror pod进行记录）
+kubelet监听到Pod目录发生改变之后，比如有新建的Pod，首先在Node节点上为Pod创建数据目录，然后检查当前正在运行的Pod，如果没有要创建的Pod则进行Pod内容器的创建，然后会在Pod当中首先创建一个Pause容器，后面就是调用Docker Client进行镜像拉取以及容器创建的流程了
+
+**容器健康管理**：  kubelet定期会调用容器的Liveness探针来确定容器的健康状况，liveness探针包括三种方式：
++ 命令执行方式（在容器内可以正常执行命令即表示容器ok， docker exec）
++ TCP+Port方式（能正常访问端口即表示容器ok）
++ url访问方式 （针对web服务的吧，能正常访问指定的url，获取的response code大于等于200小于400即为容器ok）
+
+**kube-proxy**: kube-porxy作为Service的反向代理与负载均衡器，Service外部以Service的Cluster-ip+port或者node ip+Nodeport的方式访问Service业务的时候，这些访问请求会首先被重定向到kube-porxy，然后经过kube-porxy的路由再到达最终的POD
+kube-porxy是通过添加iptables来实现重定向的，具体实现是首先kube-porxy会获取一个随机端口作为自己的重定向监听端口，然后添加从外部容器、主机通过Cluster-ip访问的iptables，以及本地的容器、主机通过Nodeport访问的iptables（对于本地容器，重定向目的为kube-porxy的端口，对于外部对象，目的为proxy的ip+proxy的port）
+kube-porxy中使用的负载均衡规则为Round Robin算法，除了通常的负载均衡功能之外，还可以配置会话保持（未超时的session一直重定向到同一个Pod），以及配置亲和性（比如按Client ip配置亲和性，让同一个Client ip过来的请求一直访问同一个Pod）
+
+**安全管理**：安全管理分几个阶段，首先是认证，再是授权，最后是准入控制；认证阶段有三种方式进行认证，分别是SSL认证（就是HTTPS），HTTP Token，以及使用用户名+密码来认证；
+这里一并写一下HTTPS的认证，HTTPS认证是依赖于CA证书的一种认证方式，Web服务方会向第三方机构申请CA证书（默认这个第三方机构是可信的），然后服务方就有这个CA证书了，然后在服务方接收到请求方的请求之后，会将证书发送给请求方（这个发送过程需要确保这个CA证书不会被中间窃听修改），发送前会用CA证书的私钥进行计算生成数字签名（对于证书的任何篡改都会改变这个数字签名，可以将这个数字签名理解为证书的指纹），请求方收到之后使用CA证书的公钥来解密数字签名，然后按照证书的HASH算法计算出HASH值对证书里的HASH值进行对比，通过之后就算是认证通过服务方是可信的了；后面双方还是进行协商生成一个加密的key用于实际HTTP请求报文的加密，保证HTTP内容不会被中间者窃听获取
+授权阶段其实就是Master上面配置的user权限，可以访问哪些资源，是否有读写权限，允许访问哪个Namespace等等配置
+最后是准入控制，就是Apiserver针对每一个kubelet的请求去匹配准入控制的列表，比如常用的安全控制（比如禁止使用Security Context），配合ResourceQuota、LimiteRanger进根据资源限制进行调控
+其中还有一个比较重要的概念是Service Account，上面说的授权是针对Kubernetes内的user账号的，这里的Service Account相当于是针对Pod内进程的账号（比User账号更加灵活、轻量级，添加也更加简单），配合Secret对象进行工作（Secret对象为保存Token、SSH key、SSL key等凭证的对象，在创建Service Account的时候会声明此Service account拥有的Secret）；Pod进程使用Service Account的方式其实就是获取Secret的过程（使用Secret对象以通过apiserver进行鉴权）； Pod获取Secret也有三种方式：
++ 在Pod的Relicate当中就写好对应的ServiceAccount
++ 通过将Secret挂载到Pod的容器当中（其实第一种也是通过这种方式关联Secret和容器的）
++ 登录仓库，从镜像仓库获取secret
+
+**k8s网络原理**：终于来到了重中之重的知识点了，在总结k8s的网络之前，要先回忆一下原生Docker网络的一些原理了
+首先原生的Docker在Docker engine启动之后会创建一个Docker0虚拟网桥（作为虚拟交换机），Docker0拥有一个16位的网段，它将会从这个网段当中抠出地址分配给新建的容器使用，同一台宿主机上面的容器网络交互都是通过Docker0进行交换的（具体原理就是创建容器的时候容器的端口也会在Docker0上面创建一个veth端口，相当于容器与虚拟交换机有了一个连线，这样容器的收发流量都能流过Docker0），但是原生的Docker不支持不同主机之间容器的网络通信，最明显的一个点就是，每一台宿主机的Docker0的网段都是一样的，同样的网段如何进行通信
+具体的实现原理就是，Docker会针对Docker0的网段创建相应的ip route以及iptables（iptables这个东西就先不细写了），实现一个效果就是所有本地访问Docker容器的ip包都会被转到Docker0上面去（通过iptable进行forward），以及非本地的访问经过iptables的dnat转换也会走到Docker0上面去，这样就实现了ip报文的重定向
+对于k8s来说，它致力于解决的几个主要问题就是解决容器与容器之间、Pod与Pod之间的通信问题
++ 对于容器与容器之间的通信： 这个比较简单，因为Pod内的容器都是基于Pause容器共享了网络空间的（牺牲了原生Docker容器之间的一些隔离性，但是提升了网络便利），容器之间网络通信直接使用localhost就ok
++ 对于Pod与Pod之间的通信，这种情况分两个场景，首先是同一个Node上面的Pod通信，我们知道k8s创建Pod的时候也是为每一个Pod分配了地址的，而这个地址是从Docker0的地址段当中拿到的，所以多个Pod之间是属于同一个网段的，因此他们的网络通信是没有任何问题的；另外一种场景，就是不同Node之间的Pod进行通信，这个比较复杂一点，需要做到两个关键点，第一个是需要我们给每一个Node上分配不同的Docker0网段，让各个Node上面的容器地址不冲突，另外就是我们需要添加路由，让发送至容器ip段的包先走本地eth0口出去到目的主机的eth0口，这里以flannel来进行说明，flannel这个组件会和k8s的组件紧密配合，首先它会结合etcd来管理各个node上面分配的地址段，然后为各个node分配不同的地址段（在启动docker的时候添加地址段参数），然后在每个Node上面都会有flannel进程，它会在各个Node上面做封装、解包的处理（我理解就是多做一层中转，重定向那些要到目的docker0地址段的包），使用UDP来进行报文传输
+
+----
+
+#####3.一些常用操作命令
+
+kubeadm init -- 启动kubernetes集群的命令，在集群启动之后，会提示添加一些环节变量，同时会生成token，需要在Node上面的启动命令携带token完成鉴权
+kubeadm reset -- 重启kube集群
